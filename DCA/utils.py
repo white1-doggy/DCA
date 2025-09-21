@@ -1,15 +1,25 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
-import numpy as np
 import nibabel as nib
-
 from collections import defaultdict
-import numpy as np
-import torch
 from scipy.sparse.linalg import svds
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn.metrics import normalized_mutual_info_score as nmi_score
+from sklearn.cluster import SpectralClustering
+
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import eigsh
+from sklearn.cluster import KMeans
+from torch_geometric.utils import to_scipy_sparse_matrix
+from scipy.sparse import identity
+from scipy.sparse.linalg import lobpcg
+from sklearn.cluster import AgglomerativeClustering
+
+from scipy import ndimage
+from scipy.optimize import linear_sum_assignment
 
 
 def weighted_bfs_connected_clustering(edge_index, edge_weight, num_nodes, k, seed=None):
@@ -79,7 +89,6 @@ def weighted_bfs_connected_clustering(edge_index, edge_weight, num_nodes, k, see
     return labels
 
 
-from scipy.optimize import linear_sum_assignment
 
 def match_labels(y_true, y_pred, n_clusters):
 
@@ -92,8 +101,6 @@ def match_labels(y_true, y_pred, n_clusters):
     return np.vectorize(lambda x: mapping.get(x, x))(y_pred)
 
 
-
-from scipy import ndimage
 
 def large_constrcut(mask):
 
@@ -124,21 +131,6 @@ def build_spatial_graph_and_weights(edge_index,features):
     return edge_weight
 
 
-
-import torch.nn.functional as F
-import torch.optim as optim
-from sklearn.metrics import normalized_mutual_info_score as nmi_score
-from sklearn.cluster import SpectralClustering
-
-import numpy as np
-import torch
-from scipy.sparse import csr_matrix
-from scipy.sparse.linalg import eigsh
-from sklearn.cluster import KMeans
-from torch_geometric.utils import to_scipy_sparse_matrix
-from scipy.sparse import identity
-from scipy.sparse.linalg import lobpcg
-from sklearn.cluster import AgglomerativeClustering
 
 def sparse_spectral_clustering(edge_index, edge_weight, num_nodes, k=2):
 
