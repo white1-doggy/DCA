@@ -1,7 +1,7 @@
 
 # DCA: Graph-Guided Deep Embedding Clustering for Brain Atlases
 
-This repository contains the official implementation of our **NeurIPS 2025** paper [**DCA: Graph-Guided Deep Embedding Clustering for Brain Atlases**](https://arxiv.org/abs/2509.01426). The method integrates pretraining and spatial graph-based constraints to generate anatomically and functionally meaningful brain atlases.
+This repository contains the official implementation of our **NeurIPS 2025** paper (5554, Poster) [**DCA: Graph-Guided Deep Embedding Clustering for Brain Atlases**](https://arxiv.org/abs/2509.01426). The method integrates pretraining and spatial graph-based constraints to generate anatomically and functionally meaningful brain atlases.
 
 ![](fig.png)
 
