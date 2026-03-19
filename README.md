@@ -1,10 +1,11 @@
 # No-Skip Swin-UNETR fMRI Representation Framework
 
-This repository now contains only the requested training framework:
+This repository contains only the requested framework modules:
 
 - `DCA/swin_unetr.py`: Swin-UNETR backbone implementation reused for the encoder.
-- `DCA/noskip_swin_framework.py`: No-skip Swin-UNETR framework, ROI aggregation, PCA target, and losses.
-- `DCA/train_fmri_repr.py`: Minimal PyTorch training entrypoint with a dummy dataset.
+- `DCA/noskip_swin_framework.py`: no-skip model, ROI aggregation, PCA target, losses, and training utilities.
+- `DCA/datasets.py`: unified dataset loading API (`BaseDataset`, `UKB`, `DummyFMRIDataset`).
+- `DCA/train_fmri_repr.py`: minimal training entrypoint.
 
 ## Core design
 
@@ -19,29 +20,34 @@ This repository now contains only the requested training framework:
   - ROI prediction loss,
   - consistency loss.
 
-## Run a minimal example
+## Dataset protocol
 
+All datasets should return a dictionary. Supported fields:
+- `fmri_sequence`: Tensor `[1,96,96,96,T]` (or `(seq, rand_seq)` for contrastive mode).
+- optional `roi_mask`: Tensor `[96,96,96]`.
+- optional metadata (`subject_name`, `target`, `TR`, `sex`, ...).
+
+`train_one_epoch` can consume either:
+- legacy batch key `x`, or
+- new batch key `fmri_sequence`.
+
+If `roi_mask` is missing, ROI is inferred from non-zero temporal energy in input voxels.
+
+## Run
+
+### Dummy
 ```bash
 cd DCA
-python train_fmri_repr.py --epochs 1 --batch_size 1 --time_channels 300
+python train_fmri_repr.py --dataset dummy --epochs 1 --batch_size 1 --time_channels 300
 ```
 
-
-## No-Skip Swin-UNETR fMRI Representation Framework
-
-A PyTorch training framework is provided in `DCA/noskip_swin_framework.py` and `DCA/train_fmri_repr.py`.
-
-Key properties:
-- Time dimension `T` is treated as input channels (`[B, 1, 96,96,96,T] -> [B, T, 96,96,96]`).
-- Swin-UNETR style encoder-decoder without skip connections.
-- Decoder output is used as voxel feature map.
-- Feature-dependent voxel weighting (`weight_head(f)` + softmax over voxels).
-- ROI-mask weighted aggregation and ROI-level prediction target built with PCA.
-- Reconstruction + ROI loss + consistency loss joint training.
-
-Minimal run (dummy data):
-
+### UKB-style loader
 ```bash
 cd DCA
-python train_fmri_repr.py --epochs 1 --batch_size 1 --time_channels 300
+python train_fmri_repr.py \
+  --dataset ukb \
+  --root /path/to/ukb_frames \
+  --sequence_length 300 \
+  --stride_within_seq 1 \
+  --stride_between_seq 1.0
 ```

@@ -268,6 +268,16 @@ def preprocess_input(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def infer_roi_mask_from_x(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Infer ROI mask from input sequence when explicit roi_mask is not provided.
+    x should be [B,T,D,H,W]. Voxels with non-zero temporal energy are considered ROI.
+    """
+    if x.ndim != 5:
+        raise ValueError(f"Expected [B,T,D,H,W], got {x.shape}")
+    return (x.abs().sum(dim=1) > eps).float()
+
+
 def train_one_epoch(
     model: FMRIRepresentationModel,
     dataloader,
@@ -280,8 +290,21 @@ def train_one_epoch(
     n = 0
 
     for batch in dataloader:
-        x = preprocess_input(batch["x"].to(device))
-        roi_mask = batch["roi_mask"].to(device)
+        if "x" in batch:
+            x_raw = batch["x"]
+        elif "fmri_sequence" in batch:
+            x_raw = batch["fmri_sequence"]
+            if isinstance(x_raw, (tuple, list)):  # contrastive dataset may return (seq, random_seq)
+                x_raw = x_raw[0]
+        else:
+            raise KeyError("Batch must contain either 'x' or 'fmri_sequence'.")
+
+        x = preprocess_input(x_raw.to(device))
+
+        if "roi_mask" in batch:
+            roi_mask = batch["roi_mask"].to(device)
+        else:
+            roi_mask = infer_roi_mask_from_x(x)
 
         optimizer.zero_grad(set_to_none=True)
         outputs = model(x, roi_mask)

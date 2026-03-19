@@ -1,34 +1,14 @@
 import argparse
-from typing import Dict
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 try:
     from .noskip_swin_framework import FMRIRepresentationModel, LossWeights, train_one_epoch
+    from .datasets import DummyFMRIDataset, UKB
 except ImportError:
     from noskip_swin_framework import FMRIRepresentationModel, LossWeights, train_one_epoch
-
-
-class DummyFMRIDataset(Dataset):
-    """
-    Minimal runnable dataset for framework validation.
-    Replace with your real dataset that returns:
-      - x: [1,96,96,96,T] or [T,96,96,96]
-      - roi_mask: [96,96,96]
-    """
-
-    def __init__(self, n_samples: int, t: int):
-        self.n_samples = n_samples
-        self.t = t
-
-    def __len__(self) -> int:
-        return self.n_samples
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        x = torch.randn(1, 96, 96, 96, self.t)
-        roi_mask = (torch.rand(96, 96, 96) > 0.7).float()
-        return {"x": x, "roi_mask": roi_mask}
+    from datasets import DummyFMRIDataset, UKB
 
 
 def main() -> None:
@@ -43,6 +23,14 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--dummy_samples", type=int, default=2)
+    parser.add_argument("--dataset", type=str, default="dummy", choices=["dummy", "ukb"])
+    parser.add_argument("--root", type=str, default="")
+    parser.add_argument("--sequence_length", type=int, default=300)
+    parser.add_argument("--stride_within_seq", type=int, default=1)
+    parser.add_argument("--stride_between_seq", type=float, default=1.0)
+    parser.add_argument("--contrastive", action="store_true")
+    parser.add_argument("--with_voxel_norm", action="store_true")
+    parser.add_argument("--shuffle_time_sequence", action="store_true")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -53,7 +41,24 @@ def main() -> None:
         roi_target_dim=args.roi_target_dim,
     ).to(device)
 
-    dataset = DummyFMRIDataset(n_samples=args.dummy_samples, t=args.time_channels)
+    if args.dataset == "dummy":
+        dataset = DummyFMRIDataset(n_samples=args.dummy_samples, t=args.time_channels)
+    else:
+        # Expected subject_dict format:
+        # {subject_id: (sex, target), ...}
+        # Replace this placeholder with your dataset split loader.
+        subject_dict = {}
+        dataset = UKB(
+            root=args.root,
+            subject_dict=subject_dict,
+            sequence_length=args.sequence_length,
+            stride_within_seq=args.stride_within_seq,
+            stride_between_seq=args.stride_between_seq,
+            contrastive=args.contrastive,
+            with_voxel_norm=args.with_voxel_norm,
+            shuffle_time_sequence=args.shuffle_time_sequence,
+            train=True,
+        )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
