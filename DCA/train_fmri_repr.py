@@ -5,10 +5,10 @@ from torch.utils.data import DataLoader
 
 try:
     from .noskip_swin_framework import FMRIRepresentationModel, LossWeights, train_one_epoch
-    from .datasets import DummyFMRIDataset, UKB
+    from .datasets import DummyFMRIDataset, PretrainSplitDataset
 except ImportError:
     from noskip_swin_framework import FMRIRepresentationModel, LossWeights, train_one_epoch
-    from datasets import DummyFMRIDataset, UKB
+    from datasets import DummyFMRIDataset, PretrainSplitDataset
 
 
 def main() -> None:
@@ -23,8 +23,10 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--dummy_samples", type=int, default=2)
-    parser.add_argument("--dataset", type=str, default="dummy", choices=["dummy", "ukb"])
-    parser.add_argument("--root", type=str, default="")
+    parser.add_argument("--dataset", type=str, default="dummy", choices=["dummy", "pretrain_split"])
+    parser.add_argument("--root", type=str, default="", help="dataset root path, e.g. /path/to/subject_folders")
+    parser.add_argument("--split_file_path", type=str, default="", help="path to split file")
+    parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
     parser.add_argument("--sequence_length", type=int, default=300)
     parser.add_argument("--stride_within_seq", type=int, default=1)
     parser.add_argument("--stride_between_seq", type=float, default=1.0)
@@ -44,20 +46,19 @@ def main() -> None:
     if args.dataset == "dummy":
         dataset = DummyFMRIDataset(n_samples=args.dummy_samples, t=args.time_channels)
     else:
-        # Expected subject_dict format:
-        # {subject_id: (sex, target), ...}
-        # Replace this placeholder with your dataset split loader.
-        subject_dict = {}
-        dataset = UKB(
+        if not args.root or not args.split_file_path:
+            raise ValueError("For pretrain_split, please provide --root and --split_file_path.")
+        dataset = PretrainSplitDataset(
             root=args.root,
-            subject_dict=subject_dict,
+            split_file_path=args.split_file_path,
+            split=args.split,
             sequence_length=args.sequence_length,
             stride_within_seq=args.stride_within_seq,
             stride_between_seq=args.stride_between_seq,
             contrastive=args.contrastive,
             with_voxel_norm=args.with_voxel_norm,
             shuffle_time_sequence=args.shuffle_time_sequence,
-            train=True,
+            train=(args.split == "train"),
         )
     loader = DataLoader(
         dataset,

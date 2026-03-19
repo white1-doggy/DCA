@@ -4,7 +4,7 @@ This repository contains only the requested framework modules:
 
 - `DCA/swin_unetr.py`: Swin-UNETR backbone implementation reused for the encoder.
 - `DCA/noskip_swin_framework.py`: no-skip model, ROI aggregation, PCA target, losses, and training utilities.
-- `DCA/datasets.py`: unified dataset loading API (`BaseDataset`, `UKB`, `DummyFMRIDataset`).
+- `DCA/datasets.py`: unified dataset loading API (`BaseDataset`, `PretrainSplitDataset`, `DummyFMRIDataset`).
 - `DCA/train_fmri_repr.py`: minimal training entrypoint.
 
 ## Core design
@@ -20,18 +20,26 @@ This repository contains only the requested framework modules:
   - ROI prediction loss,
   - consistency loss.
 
-## Dataset protocol
+## Dataset protocol (pretraining)
 
-All datasets should return a dictionary. Supported fields:
+Pretraining only needs data, no labels.
+
+Each sample should return:
 - `fmri_sequence`: Tensor `[1,96,96,96,T]` (or `(seq, rand_seq)` for contrastive mode).
-- optional `roi_mask`: Tensor `[96,96,96]`.
-- optional metadata (`subject_name`, `target`, `TR`, `sex`, ...).
+- `roi_mask` is optional.
 
 `train_one_epoch` can consume either:
 - legacy batch key `x`, or
 - new batch key `fmri_sequence`.
 
 If `roi_mask` is missing, ROI is inferred from non-zero temporal energy in input voxels.
+
+## Split file
+
+You can provide your own `split_file_path`.
+Supported formats:
+1. plain subject list (one subject per line)
+2. sectioned file with markers `train...`, `val...`, `test...`
 
 ## Run
 
@@ -41,13 +49,15 @@ cd DCA
 python train_fmri_repr.py --dataset dummy --epochs 1 --batch_size 1 --time_channels 300
 ```
 
-### UKB-style loader
+### Real pretraining dataset with your split file
 ```bash
 cd DCA
 python train_fmri_repr.py \
-  --dataset ukb \
-  --root /path/to/ukb_frames \
+  --dataset pretrain_split \
+  --root /path/to/subject_folders \
+  --split_file_path /path/to/split.txt \
+  --split train \
   --sequence_length 300 \
   --stride_within_seq 1 \
-  --stride_between_seq 1.0
+  --stride_between_seq 1
 ```

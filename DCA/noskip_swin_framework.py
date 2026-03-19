@@ -4,6 +4,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 try:
     from .swin_unetr import SwinTransformer
@@ -289,7 +290,8 @@ def train_one_epoch(
     meter = {"loss_total": 0.0, "loss_recon": 0.0, "loss_roi": 0.0, "loss_consistency": 0.0}
     n = 0
 
-    for batch in dataloader:
+    progress = tqdm(dataloader, desc="train", leave=False)
+    for batch in progress:
         if "x" in batch:
             x_raw = batch["x"]
         elif "fmri_sequence" in batch:
@@ -315,6 +317,10 @@ def train_one_epoch(
         for k in meter:
             meter[k] += float(losses[k].detach().cpu())
         n += 1
+        progress.set_postfix(
+            total=f"{float(losses['loss_total'].detach().cpu()):.4f}",
+            recon=f"{float(losses['loss_recon'].detach().cpu()):.4f}",
+        )
 
     if n == 0:
         return meter
