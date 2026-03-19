@@ -72,3 +72,23 @@ If you find our work useful for your research, please consider citing our paper:
   year={2025}
 }
 ```
+
+
+## No-Skip Swin-UNETR fMRI Representation Framework
+
+A PyTorch training framework is provided in `DCA/noskip_swin_framework.py` and `DCA/train_fmri_repr.py`.
+
+Key properties:
+- Time dimension `T` is treated as input channels (`[B, 1, 96,96,96,T] -> [B, T, 96,96,96]`).
+- Swin-UNETR style encoder-decoder without skip connections.
+- Decoder output is used as voxel feature map.
+- Feature-dependent voxel weighting (`weight_head(f)` + softmax over voxels).
+- ROI-mask weighted aggregation and ROI-level prediction target built with PCA.
+- Reconstruction + ROI loss + consistency loss joint training.
+
+Minimal run (dummy data):
+
+```bash
+cd DCA
+python train_fmri_repr.py --epochs 1 --batch_size 1 --time_channels 300
+```
