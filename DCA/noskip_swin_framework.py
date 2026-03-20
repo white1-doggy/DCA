@@ -325,3 +325,44 @@ def train_one_epoch(
     if n == 0:
         return meter
     return {k: v / n for k, v in meter.items()}
+
+
+@torch.no_grad()
+def evaluate_one_epoch(
+    model: FMRIRepresentationModel,
+    dataloader,
+    device: torch.device,
+    loss_weights: LossWeights,
+) -> Dict[str, float]:
+    model.eval()
+    meter = {"loss_total": 0.0, "loss_recon": 0.0, "loss_roi": 0.0, "loss_consistency": 0.0}
+    n = 0
+
+    progress = tqdm(dataloader, desc="val", leave=False)
+    for batch in progress:
+        if "x" in batch:
+            x_raw = batch["x"]
+        elif "fmri_sequence" in batch:
+            x_raw = batch["fmri_sequence"]
+            if isinstance(x_raw, (tuple, list)):
+                x_raw = x_raw[0]
+        else:
+            raise KeyError("Batch must contain either 'x' or 'fmri_sequence'.")
+
+        x = preprocess_input(x_raw.to(device))
+        roi_mask = batch["roi_mask"].to(device) if "roi_mask" in batch else infer_roi_mask_from_x(x)
+
+        outputs = model(x, roi_mask)
+        losses = model.compute_losses(outputs, x, loss_weights)
+
+        for k in meter:
+            meter[k] += float(losses[k].detach().cpu())
+        n += 1
+        progress.set_postfix(
+            total=f"{float(losses['loss_total'].detach().cpu()):.4f}",
+            recon=f"{float(losses['loss_recon'].detach().cpu()):.4f}",
+        )
+
+    if n == 0:
+        return meter
+    return {k: v / n for k, v in meter.items()}

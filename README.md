@@ -44,12 +44,18 @@ Supported formats:
 1. plain subject list (one subject per line)
 2. sectioned file with markers `train...`, `val...`, `test...`
 
+## Train + Validation
+
+- Training and validation are both executed during training.
+- Validation runs every `--val_interval` epochs.
+- Per-step train/val loss is shown in tqdm bars.
+
 ## Run
 
 ### Dummy
 ```bash
 cd DCA
-python train_fmri_repr.py --dataset dummy --epochs 1 --batch_size 1 --time_channels 300
+python train_fmri_repr.py --dataset dummy --epochs 5 --val_interval 1 --batch_size 1 --time_channels 300
 ```
 
 ### Real pretraining dataset with your split file
@@ -59,8 +65,8 @@ python train_fmri_repr.py \
   --dataset pretrain_split \
   --root /path/to/subject_folders \
   --split_file_path /path/to/split.txt \
-  --split train \
   --sequence_length 300 \
   --stride_within_seq 1 \
-  --stride_between_seq 1
+  --stride_between_seq 1 \
+  --val_interval 2
 ```
