@@ -51,6 +51,7 @@ Supported formats:
 - Validation runs every `--val_interval` epochs.
 - Per-step train/val loss is shown in tqdm bars (`total/recon/roi/cons`).
 
+## Run
 
 ## Optimizer / Scheduler / Checkpoint
 
