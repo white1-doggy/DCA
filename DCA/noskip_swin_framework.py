@@ -1,6 +1,8 @@
+import os
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -238,6 +240,39 @@ class FMRIRepresentationModel(nn.Module):
             "z_sub": z_sub,
         }
 
+    def compute_roi_losses(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        x: torch.Tensor,
+        roi_masks_flat: torch.Tensor,  # [B,R,V]
+        loss_weights: LossWeights,
+    ) -> Dict[str, torch.Tensor]:
+        bsz, n_rois, _ = roi_masks_flat.shape
+        l_roi_list = []
+        l_cons_list = []
+        for r in range(n_rois):
+            roi_r = roi_masks_flat[:, r, :]
+            z = self.aggregate_roi(outputs["f"], outputs["w"], roi_r)
+            y_hat = self.predictor(z)
+            y_roi = self.build_roi_target(x, roi_r)
+            y_roi = y_roi / (y_roi.sum(dim=1, keepdim=True) + 1e-6)
+            l_roi_list.append(F.mse_loss(y_hat, y_roi))
+
+            roi_sub = self.subsample_roi_mask(roi_r)
+            z_sub = self.aggregate_roi(outputs["f"], outputs["w"], roi_sub)
+            l_cons_list.append(F.mse_loss(z, z_sub))
+
+        l_recon = F.mse_loss(outputs["x_recon"], x)
+        l_roi = torch.stack(l_roi_list).mean() if l_roi_list else torch.tensor(0.0, device=x.device)
+        l_consistency = torch.stack(l_cons_list).mean() if l_cons_list else torch.tensor(0.0, device=x.device)
+        l_total = l_recon + loss_weights.lambda_roi * l_roi + loss_weights.lambda_consistency * l_consistency
+        return {
+            "loss_total": l_total,
+            "loss_recon": l_recon,
+            "loss_roi": l_roi,
+            "loss_consistency": l_consistency,
+        }
+
     def compute_losses(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -279,12 +314,68 @@ def infer_roi_mask_from_x(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return (x.abs().sum(dim=1) > eps).float()
 
 
+def load_roi_template(roi_template_path: str) -> torch.Tensor:
+    if not os.path.exists(roi_template_path):
+        raise FileNotFoundError(f"roi template not found: {roi_template_path}")
+    if roi_template_path.endswith(".pt"):
+        template = torch.load(roi_template_path)
+        return template.long()
+    if roi_template_path.endswith(".npy"):
+        return torch.from_numpy(np.load(roi_template_path)).long()
+    if roi_template_path.endswith(".nii") or roi_template_path.endswith(".nii.gz"):
+        try:
+            import nibabel as nib
+        except ImportError as e:
+            raise ImportError("Please install nibabel to load NIfTI ROI templates.") from e
+        arr = nib.load(roi_template_path).get_fdata()
+        return torch.from_numpy(arr).long()
+    raise ValueError("Unsupported roi template format. Use .pt/.npy/.nii/.nii.gz")
+
+
+def sample_roi_masks(
+    roi_template: torch.Tensor,  # [D,H,W] integer labels
+    valid_roi_mask: torch.Tensor,  # [B,D,H,W] binary
+    num_sampled_rois: int = 10,
+) -> torch.Tensor:
+    roi_template = roi_template.to(valid_roi_mask.device)
+    bsz = valid_roi_mask.shape[0]
+    flat_template = roi_template.reshape(-1)
+    masks = []
+
+    for b in range(bsz):
+        valid_b = valid_roi_mask[b].reshape(-1) > 0.5
+        labels = torch.unique(flat_template[valid_b])
+        labels = labels[labels > 0]
+        if labels.numel() == 0:
+            sampled = torch.zeros((num_sampled_rois, flat_template.numel()), device=valid_roi_mask.device)
+            masks.append(sampled)
+            continue
+
+        n = min(num_sampled_rois, int(labels.numel()))
+        perm = torch.randperm(int(labels.numel()), device=labels.device)[:n]
+        selected = labels[perm]
+        roi_masks = []
+        for label in selected:
+            m = ((flat_template == label) & valid_b).float()
+            roi_masks.append(m)
+        if n < num_sampled_rois:
+            roi_masks.extend(
+                [torch.zeros_like(roi_masks[0]) for _ in range(num_sampled_rois - n)]
+                if roi_masks
+                else [torch.zeros(flat_template.numel(), device=valid_roi_mask.device) for _ in range(num_sampled_rois)]
+            )
+        masks.append(torch.stack(roi_masks, dim=0))
+    return torch.stack(masks, dim=0)  # [B,R,V]
+
+
 def train_one_epoch(
     model: FMRIRepresentationModel,
     dataloader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     loss_weights: LossWeights,
+    roi_template: Optional[torch.Tensor] = None,
+    num_sampled_rois: int = 10,
 ) -> Dict[str, float]:
     model.train()
     meter = {"loss_total": 0.0, "loss_recon": 0.0, "loss_roi": 0.0, "loss_consistency": 0.0}
@@ -310,7 +401,11 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         outputs = model(x, roi_mask)
-        losses = model.compute_losses(outputs, x, loss_weights)
+        if roi_template is not None:
+            roi_masks_flat = sample_roi_masks(roi_template, roi_mask, num_sampled_rois=num_sampled_rois)
+            losses = model.compute_roi_losses(outputs, x, roi_masks_flat, loss_weights)
+        else:
+            losses = model.compute_losses(outputs, x, loss_weights)
         losses["loss_total"].backward()
         optimizer.step()
 
@@ -320,6 +415,8 @@ def train_one_epoch(
         progress.set_postfix(
             total=f"{float(losses['loss_total'].detach().cpu()):.4f}",
             recon=f"{float(losses['loss_recon'].detach().cpu()):.4f}",
+            roi=f"{float(losses['loss_roi'].detach().cpu()):.4f}",
+            cons=f"{float(losses['loss_consistency'].detach().cpu()):.4f}",
         )
 
     if n == 0:
@@ -333,6 +430,8 @@ def evaluate_one_epoch(
     dataloader,
     device: torch.device,
     loss_weights: LossWeights,
+    roi_template: Optional[torch.Tensor] = None,
+    num_sampled_rois: int = 10,
 ) -> Dict[str, float]:
     model.eval()
     meter = {"loss_total": 0.0, "loss_recon": 0.0, "loss_roi": 0.0, "loss_consistency": 0.0}
@@ -353,7 +452,11 @@ def evaluate_one_epoch(
         roi_mask = batch["roi_mask"].to(device) if "roi_mask" in batch else infer_roi_mask_from_x(x)
 
         outputs = model(x, roi_mask)
-        losses = model.compute_losses(outputs, x, loss_weights)
+        if roi_template is not None:
+            roi_masks_flat = sample_roi_masks(roi_template, roi_mask, num_sampled_rois=num_sampled_rois)
+            losses = model.compute_roi_losses(outputs, x, roi_masks_flat, loss_weights)
+        else:
+            losses = model.compute_losses(outputs, x, loss_weights)
 
         for k in meter:
             meter[k] += float(losses[k].detach().cpu())
@@ -361,6 +464,8 @@ def evaluate_one_epoch(
         progress.set_postfix(
             total=f"{float(losses['loss_total'].detach().cpu()):.4f}",
             recon=f"{float(losses['loss_recon'].detach().cpu()):.4f}",
+            roi=f"{float(losses['loss_roi'].detach().cpu()):.4f}",
+            cons=f"{float(losses['loss_consistency'].detach().cpu()):.4f}",
         )
 
     if n == 0:
