@@ -5,10 +5,12 @@ from torch.utils.data import DataLoader
 
 try:
     from .noskip_swin_framework import FMRIRepresentationModel, LossWeights, train_one_epoch
-    from .datasets import DummyFMRIDataset, PretrainSplitDataset
+    from .datasets import DummyFMRIDataset
+    from .data_module import PretrainDataConfig, build_pretrain_dataloader
 except ImportError:
     from noskip_swin_framework import FMRIRepresentationModel, LossWeights, train_one_epoch
-    from datasets import DummyFMRIDataset, PretrainSplitDataset
+    from datasets import DummyFMRIDataset
+    from data_module import PretrainDataConfig, build_pretrain_dataloader
 
 
 def main() -> None:
@@ -45,28 +47,30 @@ def main() -> None:
 
     if args.dataset == "dummy":
         dataset = DummyFMRIDataset(n_samples=args.dummy_samples, t=args.time_channels)
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
     else:
         if not args.root or not args.split_file_path:
             raise ValueError("For pretrain_split, please provide --root and --split_file_path.")
-        dataset = PretrainSplitDataset(
+        cfg = PretrainDataConfig(
             root=args.root,
             split_file_path=args.split_file_path,
             split=args.split,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
             sequence_length=args.sequence_length,
             stride_within_seq=args.stride_within_seq,
             stride_between_seq=args.stride_between_seq,
             contrastive=args.contrastive,
             with_voxel_norm=args.with_voxel_norm,
             shuffle_time_sequence=args.shuffle_time_sequence,
-            train=(args.split == "train"),
         )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
+        loader = build_pretrain_dataloader(cfg)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     loss_weights = LossWeights(lambda_roi=args.lambda_roi, lambda_consistency=args.lambda_consistency)

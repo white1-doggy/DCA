@@ -4,7 +4,8 @@ This repository contains only the requested framework modules:
 
 - `DCA/swin_unetr.py`: Swin-UNETR backbone implementation reused for the encoder.
 - `DCA/noskip_swin_framework.py`: no-skip model, ROI aggregation, PCA target, losses, and training utilities.
-- `DCA/datasets.py`: unified dataset loading API (`BaseDataset`, `PretrainSplitDataset`, `DummyFMRIDataset`).
+- `DCA/datasets.py`: your dataset classes (`BaseDataset`, `UKB`, `DummyFMRIDataset`) and sequence loading logic.
+- `DCA/data_module.py`: a lightweight caller to build dataloaders from `root + split_file_path` using existing dataset classes.
 - `DCA/train_fmri_repr.py`: minimal training entrypoint.
 
 ## Core design
@@ -15,14 +16,17 @@ This repository contains only the requested framework modules:
 - Decoder output is used as voxel feature map.
 - ROI aggregation uses feature-dependent voxel weights (`w = softmax(weight_head(f), dim=1)`).
 - ROI supervision target is built from ROI voxels with PCA (`torch.pca_lowrank`).
-- Training loss:
-  - reconstruction loss,
-  - ROI prediction loss,
-  - consistency loss.
+
+## What was added per your request
+
+We did **not rewrite your dataset class logic**. Instead, we added a caller (`data_module.py`) that:
+- reads subject ids from your `split_file_path`,
+- builds `subject_dict`,
+- calls your existing dataset class (default `UKB`) to create dataset/dataloader.
+
+For pretraining, labels are placeholders and not used by training loss.
 
 ## Dataset protocol (pretraining)
-
-Pretraining only needs data, no labels.
 
 Each sample should return:
 - `fmri_sequence`: Tensor `[1,96,96,96,T]` (or `(seq, rand_seq)` for contrastive mode).
@@ -36,7 +40,6 @@ If `roi_mask` is missing, ROI is inferred from non-zero temporal energy in input
 
 ## Split file
 
-You can provide your own `split_file_path`.
 Supported formats:
 1. plain subject list (one subject per line)
 2. sectioned file with markers `train...`, `val...`, `test...`

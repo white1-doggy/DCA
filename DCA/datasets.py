@@ -1,6 +1,6 @@
 import os
 import random
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -203,72 +203,3 @@ class DummyFMRIDataset(Dataset):
             "TR": 0,
             "sex": 0,
         }
-
-
-class PretrainSplitDataset(BaseDataset):
-    """
-    Dataset for pretraining with externally provided dataset path + split file path.
-    Returns only data (no labels required for pretraining).
-    """
-
-    def __init__(self, root: str, split_file_path: str, split: str = "train", **kwargs):
-        self.split_file_path = split_file_path
-        self.split = split
-        subjects = self._load_subjects(split_file_path, split)
-        # label placeholders (unused in pretraining)
-        subject_dict = {str(s): (0, 0.0) for s in subjects}
-        super().__init__(root=root, subject_dict=subject_dict, **kwargs)
-
-    @staticmethod
-    def _load_subjects(split_file_path: str, split: str) -> List[str]:
-        lines = [x.strip() for x in open(split_file_path, "r").readlines() if x.strip()]
-        # Supports either:
-        # 1) plain subject list
-        # 2) sectioned file: train_subjects / val_subjects / test_subjects
-        if not any(x.startswith(("train", "val", "test")) for x in lines):
-            return lines
-
-        split_markers = {
-            "train": "train",
-            "val": "val",
-            "test": "test",
-        }
-        target_marker = split_markers.get(split, "train")
-        idxs = {k: np.argmax([k in line for line in lines]) for k in ["train", "val", "test"]}
-        train_i, val_i, test_i = idxs["train"], idxs["val"], idxs["test"]
-        sections = {
-            "train": lines[train_i + 1 : val_i],
-            "val": lines[val_i + 1 : test_i],
-            "test": lines[test_i + 1 :],
-        }
-        return sections[target_marker]
-
-    def _set_data(self, root, subject_dict):
-        data = []
-        subjects = list(subject_dict.keys())
-        for subject in tqdm(subjects, total=len(subjects), desc=f"build {self.split} set"):
-            subject_path = os.path.join(root, f"{subject}")
-            if not os.path.exists(subject_path):
-                continue
-            num_frames = len(os.listdir(subject_path))
-            session_duration = num_frames - self.sample_duration + 1
-            for start_frame in range(0, session_duration, self.stride):
-                data.append((subject, subject_path, start_frame, self.sample_duration))
-        return data
-
-    def __getitem__(self, index):
-        subject, subject_path, start_frame, sample_duration = self.data[index]
-        if self.contrastive:
-            y, rand_y = self.load_sequence(subject_path, start_frame, sample_duration)
-            bg = float(y.flatten()[0])
-            y = torch.nn.functional.pad(y.permute(0, 4, 1, 2, 3), (11, 12, 3, 3, 11, 12), value=bg).permute(0, 2, 3, 4, 1)
-            bg2 = float(rand_y.flatten()[0])
-            rand_y = torch.nn.functional.pad(
-                rand_y.permute(0, 4, 1, 2, 3), (11, 12, 3, 3, 11, 12), value=bg2
-            ).permute(0, 2, 3, 4, 1)
-            return {"fmri_sequence": (y, rand_y), "subject_name": subject}
-
-        y = self.load_sequence(subject_path, start_frame, sample_duration)
-        bg = float(y.flatten()[0])
-        y = torch.nn.functional.pad(y.permute(0, 4, 1, 2, 3), (11, 12, 3, 3, 11, 12), value=bg).permute(0, 2, 3, 4, 1)
-        return {"fmri_sequence": y}
