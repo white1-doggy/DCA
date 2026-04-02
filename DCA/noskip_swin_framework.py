@@ -1,6 +1,5 @@
 import os
-from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -31,32 +30,18 @@ class UpBlock3D(nn.Module):
         return self.conv(self.up(x))
 
 
-class NoSkipSwinUNETR(nn.Module):
-    """
-    Swin-UNETR-style encoder + decoder without skip connections.
+class NoSkipSwinEncoderDecoder(nn.Module):
+    """Stage-1 backbone: encoder-decoder without skip connections."""
 
-    Input:  [B, T, 96, 96, 96] (T acts as input channels)
-    Output: feature map F [B, D, 96, 96, 96]
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        img_size=(96, 96, 96),
-        feature_size: int = 48,
-        depths=(2, 2, 2, 2),
-        num_heads=(3, 6, 12, 24),
-        emb_size: int = 256,
-        use_checkpoint: bool = False,
-    ) -> None:
+    def __init__(self, in_channels: int, feature_size: int = 48, emb_size: int = 256, use_checkpoint: bool = False) -> None:
         super().__init__()
         self.encoder = SwinTransformer(
             in_chans=in_channels,
             embed_dim=feature_size,
             window_size=(7, 7, 7),
             patch_size=(2, 2, 2),
-            depths=depths,
-            num_heads=num_heads,
+            depths=(2, 2, 2, 2),
+            num_heads=(3, 6, 12, 24),
             mlp_ratio=4.0,
             qkv_bias=True,
             drop_rate=0.0,
@@ -69,15 +54,12 @@ class NoSkipSwinUNETR(nn.Module):
             downsample="merging",
             use_v2=False,
         )
-
-        # x4 is [B, 16*feature_size, 3, 3, 3] for 96^3 input and patch_size=2.
         ch0 = feature_size * 16
-        self.dec1 = UpBlock3D(ch0, feature_size * 8)   # 3 -> 6
-        self.dec2 = UpBlock3D(feature_size * 8, feature_size * 4)  # 6 -> 12
-        self.dec3 = UpBlock3D(feature_size * 4, feature_size * 2)  # 12 -> 24
-        self.dec4 = UpBlock3D(feature_size * 2, feature_size)      # 24 -> 48
-        self.dec5 = UpBlock3D(feature_size, feature_size)           # 48 -> 96
-
+        self.dec1 = UpBlock3D(ch0, feature_size * 8)
+        self.dec2 = UpBlock3D(feature_size * 8, feature_size * 4)
+        self.dec3 = UpBlock3D(feature_size * 4, feature_size * 2)
+        self.dec4 = UpBlock3D(feature_size * 2, feature_size)
+        self.dec5 = UpBlock3D(feature_size, feature_size)
         self.feature_head = nn.Conv3d(feature_size, emb_size, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -87,387 +69,319 @@ class NoSkipSwinUNETR(nn.Module):
         h = self.dec3(h)
         h = self.dec4(h)
         h = self.dec5(h)
-        return self.feature_head(h)
+        return self.feature_head(h)  # [B,E,96,96,96]
 
 
-class WeightHead(nn.Module):
-    def __init__(self, dim: int, hidden_dim: Optional[int] = None) -> None:
+class Stage1Model(nn.Module):
+    """Reconstruction-only training."""
+
+    def __init__(self, time_channels: int, emb_size: int = 256) -> None:
         super().__init__()
-        hidden = hidden_dim or max(32, dim // 2)
+        self.encoder_decoder = NoSkipSwinEncoderDecoder(in_channels=time_channels, emb_size=emb_size)
+        self.recon_head = nn.Conv3d(emb_size, time_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        feat = self.encoder_decoder(x)
+        recon = self.recon_head(feat)
+        return {"feat": feat, "recon": recon}
+
+
+class VoxelWeightNet(nn.Module):
+    def __init__(self, emb_size: int) -> None:
+        super().__init__()
+        hidden = max(32, emb_size // 2)
         self.net = nn.Sequential(
-            nn.Linear(dim, hidden),
+            nn.Conv3d(emb_size, hidden, kernel_size=1),
             nn.GELU(),
-            nn.Linear(hidden, 1),
+            nn.Conv3d(hidden, 1, kernel_size=1),
         )
 
-    def forward(self, f: torch.Tensor) -> torch.Tensor:
-        # f: [B, V, D] -> w: [B, V, 1]
-        w = self.net(f)
-        return torch.softmax(w, dim=1)
-
-
-class ROIPredictor(nn.Module):
-    def __init__(self, dim: int, k: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.GELU(),
-            nn.Linear(dim, k),
-        )
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.net(z)
-
-
-class ReconHead(nn.Module):
-    def __init__(self, dim: int, out_channels: int) -> None:
-        super().__init__()
-        self.head = nn.Conv3d(dim, out_channels, kernel_size=1)
-
-    def forward(self, f_map: torch.Tensor) -> torch.Tensor:
-        return self.head(f_map)
-
-
-@dataclass
-class LossWeights:
-    lambda_roi: float = 1.0
-    lambda_consistency: float = 0.1
-
-
-class FMRIRepresentationModel(nn.Module):
-    """
-    End-to-end framework requested in the task.
-    """
-
-    def __init__(
-        self,
-        time_channels: int,
-        feature_dim: int = 256,
-        roi_target_dim: int = 16,
-        use_checkpoint: bool = False,
-    ) -> None:
-        super().__init__()
-        self.time_channels = time_channels
-        self.feature_dim = feature_dim
-        self.roi_target_dim = roi_target_dim
-
-        self.encoder_decoder = NoSkipSwinUNETR(
-            in_channels=time_channels,
-            emb_size=feature_dim,
-            use_checkpoint=use_checkpoint,
-        )
-        self.weight_head = WeightHead(feature_dim)
-        self.predictor = ROIPredictor(feature_dim, roi_target_dim)
-        self.recon_head = ReconHead(feature_dim, time_channels)
-
-    @staticmethod
-    def flatten_feature_map(f_map: torch.Tensor) -> torch.Tensor:
-        # f_map: [B, D, 96,96,96] -> [B, V, D]
-        return f_map.reshape(f_map.shape[0], f_map.shape[1], -1).permute(0, 2, 1)
-
-    @staticmethod
-    def flatten_mask(roi_mask: torch.Tensor) -> torch.Tensor:
-        # roi_mask: [B,96,96,96] -> [B,V]
-        return roi_mask.reshape(roi_mask.shape[0], -1).float()
-
-    @staticmethod
-    def aggregate_roi(f: torch.Tensor, w: torch.Tensor, roi_mask_flat: torch.Tensor) -> torch.Tensor:
-        # f: [B,V,D], w: [B,V,1], roi_mask_flat: [B,V]
-        w_masked = w * roi_mask_flat.unsqueeze(-1)
-        denom = w_masked.sum(dim=1, keepdim=True) + 1e-6
-        w_norm = w_masked / denom
-        z = (w_norm * f).sum(dim=1)
-        return z
-
-    def build_roi_target(self, x: torch.Tensor, roi_mask_flat: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B,T,96,96,96] -> x_flat [B,T,V]
-        For each sample, extract ROI voxels [T,N_roi], perform PCA along voxel dimension,
-        and use top-K singular values as target vector y_roi [K].
-        """
-        bsz, t, _, _, _ = x.shape
-        x_flat = x.reshape(bsz, t, -1)
-        targets = []
-        for b in range(bsz):
-            valid = roi_mask_flat[b] > 0.5
-            if valid.sum() < 2:
-                targets.append(torch.zeros(self.roi_target_dim, device=x.device, dtype=x.dtype))
-                continue
-
-            x_roi = x_flat[b, :, valid]  # [T, N_roi]
-            q = min(self.roi_target_dim, x_roi.shape[0], x_roi.shape[1])
-            x_center = x_roi - x_roi.mean(dim=1, keepdim=True)
-            _, s, _ = torch.pca_lowrank(x_center, q=q, center=False)
-            vec = torch.zeros(self.roi_target_dim, device=x.device, dtype=x.dtype)
-            vec[:q] = s[:q]
-            targets.append(vec)
-        return torch.stack(targets, dim=0)
-
-    @staticmethod
-    def subsample_roi_mask(roi_mask_flat: torch.Tensor, keep_ratio: float = 0.7) -> torch.Tensor:
-        rnd = torch.rand_like(roi_mask_flat)
-        keep = (rnd < keep_ratio).float()
-        return roi_mask_flat * keep
-
-    def forward(self, x: torch.Tensor, roi_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # Input may be [B,1,96,96,96,T] or [B,T,96,96,96].
-        if x.ndim != 5:
-            raise ValueError(f"Expected x ndim=5 after preprocessing, got {x.shape}")
-
-        f_map = self.encoder_decoder(x)                    # [B,D,96,96,96]
-        f = self.flatten_feature_map(f_map)                # [B,V,D]
-        w = self.weight_head(f)                            # [B,V,1]
-
-        roi_mask_flat = self.flatten_mask(roi_mask)        # [B,V]
-        z = self.aggregate_roi(f, w, roi_mask_flat)        # [B,D]
-
-        y_hat = self.predictor(z)                          # [B,K]
-        y_roi = self.build_roi_target(x, roi_mask_flat)    # [B,K]
-
-        x_recon = self.recon_head(f_map)                   # [B,T,96,96,96]
-
-        roi_mask_sub = self.subsample_roi_mask(roi_mask_flat)
-        z_sub = self.aggregate_roi(f, w, roi_mask_sub)
-
-        return {
-            "feature_map": f_map,
-            "f": f,
-            "w": w,
-            "z": z,
-            "y_hat": y_hat,
-            "y_roi": y_roi,
-            "x_recon": x_recon,
-            "z_sub": z_sub,
-        }
-
-    def compute_roi_losses(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        x: torch.Tensor,
-        roi_masks_flat: torch.Tensor,  # [B,R,V]
-        loss_weights: LossWeights,
-    ) -> Dict[str, torch.Tensor]:
-        bsz, n_rois, _ = roi_masks_flat.shape
-        l_roi_list = []
-        l_cons_list = []
-        for r in range(n_rois):
-            roi_r = roi_masks_flat[:, r, :]
-            z = self.aggregate_roi(outputs["f"], outputs["w"], roi_r)
-            y_hat = self.predictor(z)
-            y_roi = self.build_roi_target(x, roi_r)
-            y_roi = y_roi / (y_roi.sum(dim=1, keepdim=True) + 1e-6)
-            l_roi_list.append(F.mse_loss(y_hat, y_roi))
-
-            roi_sub = self.subsample_roi_mask(roi_r)
-            z_sub = self.aggregate_roi(outputs["f"], outputs["w"], roi_sub)
-            l_cons_list.append(F.mse_loss(z, z_sub))
-
-        l_recon = F.mse_loss(outputs["x_recon"], x)
-        l_roi = torch.stack(l_roi_list).mean() if l_roi_list else torch.tensor(0.0, device=x.device)
-        l_consistency = torch.stack(l_cons_list).mean() if l_cons_list else torch.tensor(0.0, device=x.device)
-        l_total = l_recon + loss_weights.lambda_roi * l_roi + loss_weights.lambda_consistency * l_consistency
-        return {
-            "loss_total": l_total,
-            "loss_recon": l_recon,
-            "loss_roi": l_roi,
-            "loss_consistency": l_consistency,
-        }
-
-    def compute_losses(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        x: torch.Tensor,
-        loss_weights: LossWeights,
-    ) -> Dict[str, torch.Tensor]:
-        l_recon = F.mse_loss(outputs["x_recon"], x)
-        l_roi = F.mse_loss(outputs["y_hat"], outputs["y_roi"])
-        l_consistency = F.mse_loss(outputs["z"], outputs["z_sub"])
-        l_total = l_recon + loss_weights.lambda_roi * l_roi + loss_weights.lambda_consistency * l_consistency
-        return {
-            "loss_total": l_total,
-            "loss_recon": l_recon,
-            "loss_roi": l_roi,
-            "loss_consistency": l_consistency,
-        }
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return self.net(feat)  # logits [B,1,D,H,W]
 
 
 def preprocess_input(x: torch.Tensor) -> torch.Tensor:
-    """
-    Accept [B,1,96,96,96,T] and convert to [B,T,96,96,96].
-    If already [B,T,96,96,96], return as is.
-    """
     if x.ndim == 6:
-        # [B,1,D,H,W,T] -> [B,T,D,H,W]
         x = x.squeeze(1).permute(0, 4, 1, 2, 3).contiguous()
     if x.ndim != 5:
-        raise ValueError(f"Expected 5D tensor [B,T,D,H,W], got {x.shape}")
+        raise ValueError(f"Expected [B,T,D,H,W], got {x.shape}")
     return x
 
 
-def infer_roi_mask_from_x(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    Infer ROI mask from input sequence when explicit roi_mask is not provided.
-    x should be [B,T,D,H,W]. Voxels with non-zero temporal energy are considered ROI.
-    """
-    if x.ndim != 5:
-        raise ValueError(f"Expected [B,T,D,H,W], got {x.shape}")
-    return (x.abs().sum(dim=1) > eps).float()
-
-
-def load_roi_template(roi_template_path: str) -> torch.Tensor:
-    if not os.path.exists(roi_template_path):
-        raise FileNotFoundError(f"roi template not found: {roi_template_path}")
-    if roi_template_path.endswith(".pt"):
-        template = torch.load(roi_template_path)
-        return template.long()
-    if roi_template_path.endswith(".npy"):
-        return torch.from_numpy(np.load(roi_template_path)).long()
-    if roi_template_path.endswith(".nii") or roi_template_path.endswith(".nii.gz"):
+def load_volume_template(path: str) -> torch.Tensor:
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    if path.endswith(".pt"):
+        return torch.load(path).long()
+    if path.endswith(".npy"):
+        return torch.from_numpy(np.load(path)).long()
+    if path.endswith(".nii") or path.endswith(".nii.gz"):
         try:
             import nibabel as nib
         except ImportError as e:
-            raise ImportError("Please install nibabel to load NIfTI ROI templates.") from e
-        arr = nib.load(roi_template_path).get_fdata()
-        return torch.from_numpy(arr).long()
-    raise ValueError("Unsupported roi template format. Use .pt/.npy/.nii/.nii.gz")
+            raise ImportError("Please install nibabel to load NIfTI template") from e
+        return torch.from_numpy(nib.load(path).get_fdata()).long()
+    raise ValueError("Unsupported template format")
 
 
-def sample_roi_masks(
-    roi_template: torch.Tensor,  # [D,H,W] integer labels
-    valid_roi_mask: torch.Tensor,  # [B,D,H,W] binary
-    num_sampled_rois: int = 10,
-) -> torch.Tensor:
-    roi_template = roi_template.to(valid_roi_mask.device)
-    bsz = valid_roi_mask.shape[0]
-    flat_template = roi_template.reshape(-1)
-    masks = []
+def load_roi_network_map(path: str) -> torch.Tensor:
+    if path.endswith(".pt"):
+        arr = torch.load(path)
+        return arr.long().view(-1)
+    if path.endswith(".npy"):
+        return torch.from_numpy(np.load(path)).long().view(-1)
+    # txt/csv: one integer per line
+    vals = [int(x.strip()) for x in open(path, "r").readlines() if x.strip()]
+    return torch.tensor(vals, dtype=torch.long)
 
-    for b in range(bsz):
-        valid_b = valid_roi_mask[b].reshape(-1) > 0.5
-        labels = torch.unique(flat_template[valid_b])
-        labels = labels[labels > 0]
-        if labels.numel() == 0:
-            sampled = torch.zeros((num_sampled_rois, flat_template.numel()), device=valid_roi_mask.device)
-            masks.append(sampled)
+
+def resolve_roi_network_ids(sampled_roi_ids: torch.Tensor, roi_to_network: torch.Tensor) -> torch.Tensor:
+    """
+    Support two ROI->network map formats:
+    1) direct-index: map[roi_id] = network_id (length >= max_roi_id+1, map[0] optional)
+    2) sequential: map[i] = network_id for roi_id=i+1 (length == num_rois)
+    """
+    if sampled_roi_ids.numel() == 0:
+        return sampled_roi_ids.new_empty((0,), dtype=torch.long)
+
+    max_roi_id = int(sampled_roi_ids.max().item())
+    if roi_to_network.numel() > max_roi_id:
+        return roi_to_network[sampled_roi_ids.long()].long()
+
+    if roi_to_network.numel() == max_roi_id:
+        return roi_to_network[(sampled_roi_ids.long() - 1).clamp_min(0)].long()
+
+    raise ValueError(
+        f"roi_to_network length {roi_to_network.numel()} is incompatible with sampled max roi id {max_roi_id}. "
+        "Use either direct-index map (len > max_roi_id) or sequential map (len == max_roi_id)."
+    )
+
+
+def masked_recon_loss(recon: torch.Tensor, x: torch.Tensor, non_bg_mask: torch.Tensor) -> torch.Tensor:
+    # recon/x: [B,T,D,H,W], mask: [D,H,W] or [B,D,H,W], where 1 means keep
+    if non_bg_mask.ndim == 3:
+        non_bg_mask = non_bg_mask.unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+    mask = non_bg_mask.unsqueeze(1).float()  # [B,1,D,H,W]
+    diff2 = ((recon - x) ** 2) * mask
+    denom = mask.sum() * x.shape[1] + 1e-6
+    return diff2.sum() / denom
+
+
+def freeze_stage1(stage1: Stage1Model) -> None:
+    for p in stage1.parameters():
+        p.requires_grad = False
+    stage1.eval()
+
+
+def sample_roi_ids(roi_template: torch.Tensor, non_bg_mask: torch.Tensor, num_sampled_rois: int, device: torch.device) -> torch.Tensor:
+    # roi_template: [D,H,W] integer labels, >0 valid ROI ids
+    valid = (roi_template > 0) & (non_bg_mask > 0)
+    roi_ids = torch.unique(roi_template[valid])
+    roi_ids = roi_ids[roi_ids > 0]
+    if roi_ids.numel() == 0:
+        return torch.empty(0, dtype=torch.long, device=device)
+    n = min(int(roi_ids.numel()), num_sampled_rois)
+    perm = torch.randperm(int(roi_ids.numel()), device=roi_ids.device)[:n]
+    return roi_ids.to(device)[perm]
+
+
+def compute_roi_representations(
+    feat: torch.Tensor,           # [B,E,D,H,W]
+    weight_logits: torch.Tensor,  # [B,1,D,H,W]
+    roi_template: torch.Tensor,   # [D,H,W]
+    non_bg_mask: torch.Tensor,    # [D,H,W]
+    sampled_roi_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # returns roi_rep [B,R,E], norm_weight [B,1,D,H,W]
+    bsz, emb, d, h, w = feat.shape
+    v = d * h * w
+    feat_flat = feat.reshape(bsz, emb, v).transpose(1, 2)        # [B,V,E]
+    w_flat = weight_logits.reshape(bsz, v)                        # [B,V]
+
+    valid_flat = (non_bg_mask.reshape(v) > 0)
+    exp_w = torch.exp(w_flat)
+    exp_w = exp_w * valid_flat.unsqueeze(0)
+    norm_w_flat = exp_w / (exp_w.sum(dim=1, keepdim=True) + 1e-6)
+
+    roi_flat = roi_template.reshape(v)
+    reps = []
+    for roi_id in sampled_roi_ids:
+        idx = (roi_flat == roi_id) & valid_flat
+        if idx.sum() == 0:
+            reps.append(torch.zeros((bsz, emb), device=feat.device, dtype=feat.dtype))
+            continue
+        roi_logits = w_flat[:, idx]                 # [B,N]
+        alpha = torch.softmax(roi_logits, dim=1)    # within-ROI softmax
+        roi_feat = feat_flat[:, idx, :]             # [B,N,E]
+        rep = (alpha.unsqueeze(-1) * roi_feat).sum(dim=1)
+        reps.append(rep)
+
+    if len(reps) == 0:
+        roi_rep = torch.zeros((bsz, 0, emb), device=feat.device, dtype=feat.dtype)
+    else:
+        roi_rep = torch.stack(reps, dim=1)          # [B,R,E]
+
+    norm_weight = norm_w_flat.reshape(bsz, 1, d, h, w)
+    return roi_rep, norm_weight
+
+
+def compute_similarity_margin_loss(
+    roi_rep: torch.Tensor,            # [B,R,E]
+    sampled_roi_ids: torch.Tensor,    # [R]
+    roi_to_network: torch.Tensor,     # [N_roi_max+1] or [N_roi]
+    margin: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if roi_rep.shape[1] == 0:
+        z = torch.tensor(0.0, device=roi_rep.device)
+        return z, z, z
+
+    rep = F.normalize(roi_rep, dim=-1)
+    sim = torch.matmul(rep, rep.transpose(1, 2))  # [B,R,R]
+
+    # map ROI id -> network id
+    net_ids = resolve_roi_network_ids(sampled_roi_ids, roi_to_network)  # [R]
+    unique_nets = torch.unique(net_ids)
+
+    loss_list, intra_list, inter_list = [], [], []
+    for net in unique_nets:
+        in_idx = torch.where(net_ids == net)[0]
+        out_idx = torch.where(net_ids != net)[0]
+        if in_idx.numel() < 2 or out_idx.numel() < 1:
             continue
 
-        n = min(num_sampled_rois, int(labels.numel()))
-        perm = torch.randperm(int(labels.numel()), device=labels.device)[:n]
-        selected = labels[perm]
-        roi_masks = []
-        for label in selected:
-            m = ((flat_template == label) & valid_b).float()
-            roi_masks.append(m)
-        if n < num_sampled_rois:
-            roi_masks.extend(
-                [torch.zeros_like(roi_masks[0]) for _ in range(num_sampled_rois - n)]
-                if roi_masks
-                else [torch.zeros(flat_template.numel(), device=valid_roi_mask.device) for _ in range(num_sampled_rois)]
-            )
-        masks.append(torch.stack(roi_masks, dim=0))
-    return torch.stack(masks, dim=0)  # [B,R,V]
+        # intra: all pairs in same network (upper triangle)
+        intra_mat = sim[:, in_idx][:, :, in_idx]  # [B,ni,ni]
+        triu = torch.triu_indices(in_idx.numel(), in_idx.numel(), offset=1, device=sim.device)
+        intra_vals = intra_mat[:, triu[0], triu[1]]
+
+        # inter: pairs across in/out
+        inter_vals = sim[:, in_idx][:, :, out_idx].reshape(sim.shape[0], -1)
+
+        if intra_vals.numel() == 0 or inter_vals.numel() == 0:
+            continue
+
+        k_intra = max(1, int(0.1 * intra_vals.shape[1]))
+        k_inter = max(1, int(0.1 * inter_vals.shape[1]))
+
+        s_intra = torch.topk(intra_vals, k=k_intra, dim=1, largest=False).values.mean(dim=1)  # lowest 10%
+        s_inter = torch.topk(inter_vals, k=k_inter, dim=1, largest=True).values.mean(dim=1)   # highest 10%
+
+        loss_net = F.relu(margin - s_intra + s_inter)
+        loss_list.append(loss_net)
+        intra_list.append(s_intra)
+        inter_list.append(s_inter)
+
+    if len(loss_list) == 0:
+        z = torch.tensor(0.0, device=roi_rep.device)
+        return z, z, z
+
+    loss = torch.cat(loss_list).mean()
+    s_intra_mean = torch.cat(intra_list).mean()
+    s_inter_mean = torch.cat(inter_list).mean()
+    return loss, s_intra_mean, s_inter_mean
 
 
-def train_one_epoch(
-    model: FMRIRepresentationModel,
+def stage1_train_one_epoch(
+    model: Stage1Model,
     dataloader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    loss_weights: LossWeights,
-    roi_template: Optional[torch.Tensor] = None,
-    num_sampled_rois: int = 10,
+    non_bg_mask: torch.Tensor,
 ) -> Dict[str, float]:
     model.train()
-    meter = {"loss_total": 0.0, "loss_recon": 0.0, "loss_roi": 0.0, "loss_consistency": 0.0}
+    meter = {"loss_recon": 0.0}
     n = 0
-
-    progress = tqdm(dataloader, desc="train", leave=False)
-    for batch in progress:
-        if "x" in batch:
-            x_raw = batch["x"]
-        elif "fmri_sequence" in batch:
-            x_raw = batch["fmri_sequence"]
-            if isinstance(x_raw, (tuple, list)):  # contrastive dataset may return (seq, random_seq)
-                x_raw = x_raw[0]
-        else:
-            raise KeyError("Batch must contain either 'x' or 'fmri_sequence'.")
-
+    pbar = tqdm(dataloader, desc="stage1-train", leave=False)
+    for batch in pbar:
+        x_raw = batch["fmri_sequence"] if "fmri_sequence" in batch else batch["x"]
+        if isinstance(x_raw, (tuple, list)):
+            x_raw = x_raw[0]
         x = preprocess_input(x_raw.to(device))
 
-        if "roi_mask" in batch:
-            roi_mask = batch["roi_mask"].to(device)
-        else:
-            roi_mask = infer_roi_mask_from_x(x)
-
         optimizer.zero_grad(set_to_none=True)
-        outputs = model(x, roi_mask)
-        if roi_template is not None:
-            roi_masks_flat = sample_roi_masks(roi_template, roi_mask, num_sampled_rois=num_sampled_rois)
-            losses = model.compute_roi_losses(outputs, x, roi_masks_flat, loss_weights)
-        else:
-            losses = model.compute_losses(outputs, x, loss_weights)
-        losses["loss_total"].backward()
+        out = model(x)
+        loss = masked_recon_loss(out["recon"], x, non_bg_mask)
+        loss.backward()
         optimizer.step()
 
-        for k in meter:
-            meter[k] += float(losses[k].detach().cpu())
+        meter["loss_recon"] += float(loss.detach().cpu())
         n += 1
-        progress.set_postfix(
-            total=f"{float(losses['loss_total'].detach().cpu()):.4f}",
-            recon=f"{float(losses['loss_recon'].detach().cpu()):.4f}",
-            roi=f"{float(losses['loss_roi'].detach().cpu()):.4f}",
-            cons=f"{float(losses['loss_consistency'].detach().cpu()):.4f}",
-        )
+        pbar.set_postfix(recon=f"{float(loss.detach().cpu()):.4f}")
 
-    if n == 0:
-        return meter
-    return {k: v / n for k, v in meter.items()}
+    return {k: (v / max(n, 1)) for k, v in meter.items()}
 
 
 @torch.no_grad()
-def evaluate_one_epoch(
-    model: FMRIRepresentationModel,
+def stage1_extract_feature(model: Stage1Model, x: torch.Tensor) -> torch.Tensor:
+    return model(x)["feat"]
+
+
+def stage2_train_one_epoch(
+    stage1: Stage1Model,
+    weight_net: VoxelWeightNet,
     dataloader,
+    optimizer: torch.optim.Optimizer,
     device: torch.device,
-    loss_weights: LossWeights,
-    roi_template: Optional[torch.Tensor] = None,
+    non_bg_mask: torch.Tensor,
+    roi_template: torch.Tensor,
+    roi_to_network: torch.Tensor,
     num_sampled_rois: int = 10,
+    margin: float = 0.2,
 ) -> Dict[str, float]:
-    model.eval()
-    meter = {"loss_total": 0.0, "loss_recon": 0.0, "loss_roi": 0.0, "loss_consistency": 0.0}
+    freeze_stage1(stage1)
+    weight_net.train()
+
+    meter = {"loss_total": 0.0, "s_intra": 0.0, "s_inter": 0.0}
     n = 0
+    pbar = tqdm(dataloader, desc="stage2-train", leave=False)
 
-    progress = tqdm(dataloader, desc="val", leave=False)
-    for batch in progress:
-        if "x" in batch:
-            x_raw = batch["x"]
-        elif "fmri_sequence" in batch:
-            x_raw = batch["fmri_sequence"]
-            if isinstance(x_raw, (tuple, list)):
-                x_raw = x_raw[0]
-        else:
-            raise KeyError("Batch must contain either 'x' or 'fmri_sequence'.")
-
+    for batch in pbar:
+        x_raw = batch["fmri_sequence"] if "fmri_sequence" in batch else batch["x"]
+        if isinstance(x_raw, (tuple, list)):
+            x_raw = x_raw[0]
         x = preprocess_input(x_raw.to(device))
-        roi_mask = batch["roi_mask"].to(device) if "roi_mask" in batch else infer_roi_mask_from_x(x)
 
-        outputs = model(x, roi_mask)
-        if roi_template is not None:
-            roi_masks_flat = sample_roi_masks(roi_template, roi_mask, num_sampled_rois=num_sampled_rois)
-            losses = model.compute_roi_losses(outputs, x, roi_masks_flat, loss_weights)
-        else:
-            losses = model.compute_losses(outputs, x, loss_weights)
+        with torch.no_grad():
+            feat = stage1_extract_feature(stage1, x)  # [B,E,D,H,W]
 
-        for k in meter:
-            meter[k] += float(losses[k].detach().cpu())
-        n += 1
-        progress.set_postfix(
-            total=f"{float(losses['loss_total'].detach().cpu()):.4f}",
-            recon=f"{float(losses['loss_recon'].detach().cpu()):.4f}",
-            roi=f"{float(losses['loss_roi'].detach().cpu()):.4f}",
-            cons=f"{float(losses['loss_consistency'].detach().cpu()):.4f}",
+        optimizer.zero_grad(set_to_none=True)
+        weight_logits = weight_net(feat)
+
+        sampled_roi_ids = sample_roi_ids(roi_template, non_bg_mask, num_sampled_rois, device=device)
+        roi_rep, _ = compute_roi_representations(feat, weight_logits, roi_template, non_bg_mask, sampled_roi_ids)
+
+        loss, s_intra, s_inter = compute_similarity_margin_loss(
+            roi_rep, sampled_roi_ids, roi_to_network=roi_to_network, margin=margin
         )
+        loss.backward()
+        optimizer.step()
 
-    if n == 0:
-        return meter
-    return {k: v / n for k, v in meter.items()}
+        meter["loss_total"] += float(loss.detach().cpu())
+        meter["s_intra"] += float(s_intra.detach().cpu())
+        meter["s_inter"] += float(s_inter.detach().cpu())
+        n += 1
+        pbar.set_postfix(loss=f"{float(loss.detach().cpu()):.4f}", intra=f"{float(s_intra.detach().cpu()):.4f}", inter=f"{float(s_inter.detach().cpu()):.4f}")
+
+    return {k: (v / max(n, 1)) for k, v in meter.items()}
+
+
+@torch.no_grad()
+def infer_weight_map(
+    stage1: Stage1Model,
+    weight_net: VoxelWeightNet,
+    x: torch.Tensor,
+    non_bg_mask: torch.Tensor,
+) -> torch.Tensor:
+    freeze_stage1(stage1)
+    weight_net.eval()
+    x = preprocess_input(x)
+    feat = stage1_extract_feature(stage1, x)
+    logits = weight_net(feat)
+
+    bsz, _, d, h, w = logits.shape
+    v = d * h * w
+    flat = logits.reshape(bsz, v)
+    valid = (non_bg_mask.reshape(v) > 0).to(flat.device)
+    exp_w = torch.exp(flat) * valid.unsqueeze(0)
+    norm = exp_w / (exp_w.sum(dim=1, keepdim=True) + 1e-6)
+    return norm.reshape(bsz, 1, d, h, w)

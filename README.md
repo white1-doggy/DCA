@@ -1,93 +1,61 @@
-# No-Skip Swin-UNETR fMRI Representation Framework
+# Two-Stage fMRI Training (No-Skip Swin Encoder-Decoder)
 
-This repository contains only the requested framework modules:
+This repository now uses a **two-stage** training design.
 
-- `DCA/swin_unetr.py`: Swin-UNETR backbone implementation reused for the encoder.
-- `DCA/noskip_swin_framework.py`: no-skip model, ROI aggregation, PCA target, losses, and training utilities.
-- `DCA/datasets.py`: your dataset classes (`BaseDataset`, `UKB`, `DummyFMRIDataset`) and sequence loading logic.
-- `DCA/data_module.py`: a lightweight caller to build dataloaders from `root + split_file_path` using existing dataset classes.
-- `DCA/train_fmri_repr.py`: minimal training entrypoint.
+## Stage 1: Reconstruction only
+- Train only reconstruction task.
+- Loss is masked MSE on non-background voxels, using a provided background mask template (`--bg_mask_path`).
+- Output feature map from backbone: `[B, E, 96, 96, 96]`.
 
-## Core design
+## Stage 2: ROI-weight learning with frozen Stage 1
+- Freeze Stage-1 weights.
+- Train a new weight network `W` to produce voxel weights `[B,1,96,96,96]`.
+- Use ROI template (e.g. Schaefer200) and sampled ROI ids (`--num_sampled_rois`, default 10) per step.
+- Compute ROI representations by within-ROI softmax over weights and weighted sum over voxel features.
+- Compute similarity margin loss using 7-network mapping (`--roi_network_map_path`):
+  - `S_intra`: bottom 10% intra-network similarities
+  - `S_inter`: top 10% inter-network similarities
+  - `Loss = max(0, m - mean(S_intra) + mean(S_inter))`
+  - ROI-network map supports both:
+    - direct indexing: `map[roi_id] = network_id`
+    - sequential list: line `i` means ROI `i+1`
 
-- Input: `X ∈ [B, 1, 96, 96, 96, T]` or `[B, T, 96, 96, 96]`.
-- Time dimension `T` is treated as input channels.
-- Encoder-decoder uses Swin-UNETR style encoder and decoder **without skip connections**.
-- Decoder output is used as voxel feature map.
-- ROI aggregation uses feature-dependent voxel weights (`w = softmax(weight_head(f), dim=1)`).
-- ROI supervision target is built from ROI voxels with PCA (`torch.pca_lowrank`).
-- At each step, 10 random ROIs are sampled from a provided ROI template path for ROI-related losses.
+## Inference
+- Use trained Stage-2 weight network to infer whole-brain normalized weight map.
 
-## What was added per your request
-
-We did **not rewrite your dataset class logic**. Instead, we added a caller (`data_module.py`) that:
-- reads subject ids from your `split_file_path`,
-- builds `subject_dict`,
-- calls your existing dataset class (default `UKB`) to create dataset/dataloader.
-
-For pretraining, labels are placeholders and not used by training loss.
-
-## Dataset protocol (pretraining)
-
-Each sample should return:
-- `fmri_sequence`: Tensor `[1,96,96,96,T]` (or `(seq, rand_seq)` for contrastive mode).
-- `roi_mask` is optional.
-
-`train_one_epoch` can consume either:
-- legacy batch key `x`, or
-- new batch key `fmri_sequence`.
-
-If `roi_mask` is missing, ROI is inferred from non-zero temporal energy in input voxels.
-
-## Split file
-
-Supported formats:
-1. plain subject list (one subject per line)
-2. sectioned file with markers `train...`, `val...`, `test...`
-
-## Train + Validation
-
-- Training and validation are both executed during training.
-- Validation runs every `--val_interval` epochs.
-- Per-step train/val loss is shown in tqdm bars (`total/recon/roi/cons`).
-
-## Run
-
-## Optimizer / Scheduler / Checkpoint
-
-- Optimizer options: `--optimizer adam` or `--optimizer adamw`.
-- Cosine annealing: `--scheduler cosine --eta_min 1e-6` (or `--scheduler none`).
-- Checkpoint save: `--save_dir ./checkpoints --save_every 1` (saves `epoch_*.pt`).
-- Best checkpoint (by validation loss): auto-saved to `best.pt` when validation is available.
-- Resume training: `--resume_checkpoint /path/to/checkpoint.pt`.
-
-## Run
-
-### Dummy
-```bash
-cd DCA
-python train_fmri_repr.py --dataset dummy --epochs 5 --val_interval 1 --batch_size 1 --time_channels 300 --roi_template_path /path/to/roi_template.npy --num_sampled_rois 10 \
-  --optimizer adam \
-  --scheduler cosine \
-  --save_dir ./checkpoints \
-  --save_every 1
-```
-
-### Real pretraining dataset with your split file
+## Run training
 ```bash
 cd DCA
 python train_fmri_repr.py \
   --dataset pretrain_split \
   --root /path/to/subject_folders \
   --split_file_path /path/to/split.txt \
-  --sequence_length 300 \
-  --stride_within_seq 1 \
-  --stride_between_seq 1 \
-  --val_interval 2 \
-  --roi_template_path /path/to/roi_template.npy \
+  --time_channels 300 \
+  --feature_dim 256 \
+  --stage1_epochs 10 \
+  --stage2_epochs 10 \
+  --lr_stage1 1e-4 \
+  --lr_stage2 1e-4 \
+  --bg_mask_path /path/to/non_bg_mask.npy \
+  --roi_template_path /path/to/schaefer200.npy \
+  --roi_network_map_path /path/to/roi_to_7network.txt \
   --num_sampled_rois 10 \
-  --optimizer adam \
-  --scheduler cosine \
-  --save_dir ./checkpoints \
-  --save_every 1
+  --margin 0.2 \
+  --save_dir ./checkpoints
+```
+
+## Run inference
+```bash
+cd DCA
+python train_fmri_repr.py \
+  --dataset pretrain_split \
+  --root /path/to/subject_folders \
+  --split_file_path /path/to/split.txt \
+  --bg_mask_path /path/to/non_bg_mask.npy \
+  --roi_template_path /path/to/schaefer200.npy \
+  --roi_network_map_path /path/to/roi_to_7network.txt \
+  --resume_stage1 ./checkpoints/stage1_epoch_10.pt \
+  --resume_stage2 ./checkpoints/stage2_best.pt \
+  --infer_only \
+  --infer_save_path ./infer_weight_map.pt
 ```
